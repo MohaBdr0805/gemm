@@ -1,0 +1,35 @@
+# Build
+build/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+!CMakeLists.txt
+
+# Objets / binaires
+*.o
+*.obj
+*.exe
+*.lib
+*.a
+*.so
+*.dll
+*.exp
+*.pdb
+*.ilk
+
+# IDE / outils
+.vs/
+.vscode/
+.idea/
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Doc interne de reprise (perso, hors repo public)
+HANDOFF.md
