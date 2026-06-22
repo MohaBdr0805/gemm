@@ -1,9 +1,6 @@
-// Tiled GEMM on the GPU: C = alpha*A*B + beta*C, row-major matrices.
-// A 16x16 block computes one tile of C; A and B are streamed through shared
-// memory to amortize global-memory traffic.
-//
-// This file also contains the FUSED inference epilogue (GEMM + bias + activation),
-// the core pattern of an inference engine.
+// GEMM on the GPU: C = alpha*A*B + beta*C, row-major.
+// Holds the shared-memory tiled kernel (v1), the register-tiled kernel (v2),
+// and the fused bias+activation epilogue used for inference.
 #include "gemm/gemm_cuda.cuh"
 
 #include <cuda_runtime.h>
@@ -24,9 +21,7 @@
 
 namespace gemm {
 
-// ---------------------------------------------------------------------------
-// Base GEMM. As/Bs padded to TILE+1 to avoid bank conflicts.
-// ---------------------------------------------------------------------------
+// v1: shared-memory tiled. As/Bs padded to TILE+1 to dodge bank conflicts.
 __global__ void gemm_kernel(int M, int N, int K, float alpha,
                             const float* __restrict__ A,
                             const float* __restrict__ B,
@@ -60,13 +55,9 @@ __global__ void gemm_kernel(int M, int N, int K, float alpha,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fused GEMM + bias + activation.
-// Same as the kernel above, but the epilogue adds bias[col] and applies the
-// activation BEFORE writing to global memory -> one write pass, one launch.
-// ACT is a template parameter (compile-time constant), so apply_act() is
-// resolved at compile time: no branch in the kernel.
-// ---------------------------------------------------------------------------
+// Same tiling as gemm_kernel, but the epilogue adds bias[col] and applies the
+// activation before the global write -> one pass, one launch. ACT is a template
+// parameter, so apply_act() folds away at compile time (no branch in the loop).
 template <Activation ACT>
 __global__ void gemm_bias_act_kernel(int M, int N, int K, float alpha,
                                      const float* __restrict__ A,
@@ -99,15 +90,13 @@ __global__ void gemm_bias_act_kernel(int M, int N, int K, float alpha,
     if (row < M && col < N) {
         const int idx = row * N + col;
         float v = alpha * acc + beta * C[idx];
-        if (bias) v += bias[col];          // per-output-column bias
-        C[idx] = apply_act(ACT, v);        // fused activation
+        if (bias) v += bias[col];
+        C[idx] = apply_act(ACT, v);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Separate element-wise bias+activation (the NON-fused path, for comparison).
-// Represents the second global-memory pass that fusion removes.
-// ---------------------------------------------------------------------------
+// The non-fused path: a separate element-wise bias+activation pass. This is the
+// extra global-memory pass that fusion removes; kept only for the benchmark.
 template <Activation ACT>
 __global__ void bias_act_kernel(int M, int N, float* __restrict__ C,
                                 const float* __restrict__ bias) {
@@ -120,9 +109,6 @@ __global__ void bias_act_kernel(int M, int N, float* __restrict__ C,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host wrapper: base GEMM.
-// ---------------------------------------------------------------------------
 void gemm_cuda(int M, int N, int K, float alpha,
                const float* A, const float* B, float beta, float* C) {
     const size_t sa = (size_t)M * K * sizeof(float);
@@ -136,7 +122,7 @@ void gemm_cuda(int M, int N, int K, float alpha,
 
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice)); // needed for the beta*C term
+    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice)); // for the beta*C term
 
     dim3 block(TILE, TILE);
     dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
@@ -148,7 +134,7 @@ void gemm_cuda(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// Selects the template instantiation of the fused kernel from a runtime `act`.
+// Pick the right template instantiation for a runtime `act`.
 static void launch_fused(dim3 grid, dim3 block, int M, int N, int K, float alpha,
                          const float* dA, const float* dB, float beta,
                          float* dC, const float* dbias, Activation act) {
@@ -162,9 +148,6 @@ static void launch_fused(dim3 grid, dim3 block, int M, int N, int K, float alpha
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host wrapper: fused GEMM + bias + activation epilogue.
-// ---------------------------------------------------------------------------
 void gemm_bias_act_cuda(int M, int N, int K, float alpha,
                         const float* A, const float* B, float beta, float* C,
                         const float* bias, Activation act) {
@@ -196,11 +179,8 @@ void gemm_bias_act_cuda(int M, int N, int K, float alpha,
     if (dbias) cudaFree(dbias);
 }
 
-// ---------------------------------------------------------------------------
-// Benchmark: fusion vs two-pass. Device timing (cudaEvent), excludes transfers
-// and malloc -> measures exactly what fusion changes: one launch and one global
-// memory pass fewer. alpha=1, beta=0 = an inference linear layer Y = act(X*W + b).
-// ---------------------------------------------------------------------------
+// Fused vs two-pass, timed on the device (cudaEvent), excluding transfers and
+// malloc. alpha=1, beta=0 is the inference linear layer Y = act(X*W + b).
 void benchmark_fusion(int M, int N, int K, Activation act) {
     const float alpha = 1.0f, beta = 0.0f;
     const size_t sa = (size_t)M * K * sizeof(float);
@@ -224,16 +204,15 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
 
     auto run_fused = [&]{ launch_fused(grid, block, M, N, K, alpha, dA, dB, beta, dC, dbias, act); };
     auto run_two_pass = [&]{
-        gemm_kernel<<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);   // 1st kernel
-        switch (act) {                                                     // 2nd kernel (extra pass)
+        gemm_kernel<<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+        switch (act) {
             case Activation::ReLU: bias_act_kernel<Activation::ReLU><<<blocks, threads>>>(M, N, dC, dbias); break;
             case Activation::GELU: bias_act_kernel<Activation::GELU><<<blocks, threads>>>(M, N, dC, dbias); break;
             default:               bias_act_kernel<Activation::None><<<blocks, threads>>>(M, N, dC, dbias); break;
         }
     };
 
-    // Warm-up (context init + JIT cache).
-    run_fused(); run_two_pass();
+    run_fused(); run_two_pass(); // warm-up
     CUDA_CHECK(cudaDeviceSynchronize());
 
     const int iters = 50;
@@ -260,19 +239,16 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dbias);
 }
 
-// ---------------------------------------------------------------------------
-// Register-tiled GEMM (v2). Each thread computes a TM x TN micro-block of C
-// (8x8 = 64 outputs) kept in registers, instead of a single element. Each value
-// loaded from shared memory is reused TM (or TN) times -> much higher arithmetic
-// intensity, the main lever once occupancy is already saturated (see README).
-// Block tile BM x BN = 128 x 128, K stepped in chunks of BK = 8, 256 threads.
-// ---------------------------------------------------------------------------
+// v2: register tiling. 128x128 block tile, K in steps of BK=8, 256 threads, each
+// thread holding an 8x8 micro-block of C in registers. Every shared-memory load
+// feeds 8 FMAs (8x8 outer product), so arithmetic intensity is much higher than
+// v1 -- the real lever once occupancy is saturated.
 __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
                                 const float* __restrict__ A,
                                 const float* __restrict__ B,
                                 float beta, float* __restrict__ C) {
     constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
-    constexpr int NT = (BM / TM) * (BN / TN); // threads per block = 256
+    constexpr int NT = (BM / TM) * (BN / TN); // 256 threads/block
 
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
@@ -281,8 +257,8 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
     const int blockCol = blockIdx.x * BN;
 
     const int tid = threadIdx.x;
-    const int threadCol = tid % (BN / TN);   // 0..15
-    const int threadRow = tid / (BN / TN);   // 0..15
+    const int threadCol = tid % (BN / TN);
+    const int threadRow = tid / (BN / TN);
 
     float acc[TM][TN];
     #pragma unroll
@@ -291,7 +267,7 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
         for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
     float regM[TM], regN[TN];
 
-    // Cooperative-load indices (the NT threads fill the BM*BK and BK*BN tiles).
+    // Indices for the cooperative load of the BM*BK and BK*BN shared tiles.
     const int innerRowA = tid / BK, innerColA = tid % BK, strideA = NT / BK;
     const int innerRowB = tid / BN, innerColB = tid % BN, strideB = NT / BN;
 
@@ -310,8 +286,6 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
         }
         __syncthreads();
 
-        // Each thread loads its TM-row and TN-col fragments once, reuses them
-        // across the TM x TN outer product -> TM*TN FMAs per TM+TN shared loads.
         #pragma unroll
         for (int kk = 0; kk < BK; ++kk) {
             #pragma unroll
@@ -340,7 +314,6 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
     }
 }
 
-// Host wrapper: register-tiled GEMM (v2).
 void gemm_cuda_reg(int M, int N, int K, float alpha,
                    const float* A, const float* B, float beta, float* C) {
     const size_t sa = (size_t)M * K * sizeof(float);
@@ -366,8 +339,7 @@ void gemm_cuda_reg(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// Benchmark: v1 (shared-memory tiled) vs v2 (register tiled). Device timing, no
-// transfers -> the pure kernel speedup that register tiling buys.
+// v1 vs v2, device timing, no transfers -> the pure kernel speedup from tiling.
 void benchmark_gemm_versions(int M, int N, int K) {
     const float alpha = 1.0f, beta = 0.0f;
     const size_t sa = (size_t)M * K * sizeof(float);
