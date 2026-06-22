@@ -1,7 +1,8 @@
 # gemm-optim
 
 Optimized **GEMM** (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, with performance
-analysis. Row-major matrices, single precision.
+analysis — from optimized CPU compute to **GPU kernels for neural-network
+inference**. Row-major matrices, single precision.
 
 GEMM is the workhorse of dense linear algebra (BLAS level 3): the classic ground
 for demonstrating mastery of memory optimization and parallelism, on both CPU and
@@ -13,6 +14,8 @@ optimizations that matter — measuring each gain.
 - **CPU**: cache blocking (tiling) + **OpenMP** parallelization, race-free.
 - **GPU**: **shared-memory tiled CUDA kernel**, **coalesced** accesses, border
   handling (sizes not multiples of the tile), **bank-conflict padding**.
+- **Inference**: **fused GEMM + bias + activation (ReLU/GELU)** epilogue in a
+  single launch — the core pattern of an inference engine.
 - **Method**: systematic correctness test against the naive oracle, GFLOP/s
   benchmark, and **occupancy analysis** to pinpoint the real bottleneck.
 
@@ -64,6 +67,31 @@ therefore not occupancy but **register tiling** (each thread computes a micro-bl
 of `C`, e.g. `4×4`), which raises reuse and arithmetic intensity. *(Next step of
 the project.)*
 
+## Fused inference epilogue (GEMM + bias + activation)
+
+A linear neural-network layer computes `Y = act(X·W + bias)`. Done naively that is
+**two kernels**: the GEMM, then an element-wise pass for the bias and activation —
+i.e. writing *then* re-reading the whole output through global memory. The fused
+version computes the bias and activation **in the GEMM kernel's epilogue**, before
+the first write: **one launch, one global-memory pass**. This is the optimization
+cuBLASLt, CUTLASS and TensorRT perform.
+
+- The activation is a **template parameter** of the kernel → selected at compile
+  time, no branch in the inner loop.
+- The activation math (ReLU, tanh-GELU) is **shared** between the CPU reference
+  (correctness oracle) and the GPU kernel — one source of truth (`activation.hpp`).
+- `benchmark_fusion` measures the gain in **pure device time** (no transfers).
+
+Fusion saves one `M×N` global-memory pass plus a kernel launch, so its relative
+gain scales as ~`TILE/K` plus launch overhead — it matters for **shallow layers
+and small problems**, not big square GEMMs. Measured on a GTX 1650 (GELU):
+
+| shape (M·N·K)           | fusion speedup |
+|-------------------------|----------------|
+| 2048·2048·2048          | 1.01×          |
+| 2048·2048·64 (small K)  | 1.20×          |
+| 64·64·64 (tiny)         | 1.72×          |
+
 ## Build & run
 
 **CPU** (Linux/GCC, or Windows/MinGW):
@@ -78,24 +106,25 @@ ctest --test-dir build --output-on-failure   # correctness test
 ```bash
 cmake -S . -B build -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # adds the GPU vs naive check
-./build/bench 1024                            # adds the CUDA line
+ctest --test-dir build --output-on-failure   # adds GPU + fused-epilogue checks
+./build/bench 2048                            # adds CUDA + fusion benchmark
 ```
 Target GPU architectures: `75;86` (Turing + Ampere), tunable in `CMakeLists.txt`.
 
 ## Layout
 
 ```
-include/gemm/   public headers (gemm_cpu.hpp, gemm_cuda.cuh)
-src/            implementations: gemm_cpu.cpp (naive + tiled), gemm_cuda.cu (kernel)
-benchmarks/     GFLOP/s measurements
-tests/          correctness test (optimized vs naive, borders included)
+include/gemm/   public headers (gemm_cpu.hpp, gemm_cuda.cuh, activation.hpp)
+src/            implementations: gemm_cpu.cpp (naive + tiled), gemm_cuda.cu (kernels)
+benchmarks/     GFLOP/s measurements + fusion benchmark
+tests/          correctness: tiled, CUDA, and fused epilogue vs CPU oracle
 ```
 
 ## Roadmap
 
 - [x] CPU: naive + OpenMP tiled
 - [x] GPU: shared-memory tiled CUDA kernel
+- [x] Fused inference epilogue (GEMM + bias + activation)
 - [ ] CUDA kernel v2: register tiling (micro-block per thread)
 - [ ] Dockerfile (reproducible CPU + CUDA build)
 - [ ] GitHub Actions CI (build + CPU tests)

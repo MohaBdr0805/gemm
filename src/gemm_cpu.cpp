@@ -53,4 +53,23 @@ void gemm_tiled(int M, int N, int K, float alpha,
     }
 }
 
+// CPU reference for the fused epilogue (oracle for the GPU kernel).
+// Naively computes C = act( alpha*A*B + beta*C + bias[col] ). Slow but obviously
+// correct: used to validate the fused GPU kernel.
+void gemm_bias_act_ref(int M, int N, int K, float alpha,
+                       const float* A, const float* B, float beta, float* C,
+                       const float* bias, Activation act) {
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            float acc = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                acc += A[i * K + k] * B[k * N + j];
+            }
+            float v = alpha * acc + beta * C[i * N + j];
+            if (bias) v += bias[j];           // per-output-column bias
+            C[i * N + j] = apply_act(act, v); // activation last
+        }
+    }
+}
+
 } // namespace gemm
